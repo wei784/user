@@ -5,7 +5,7 @@
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
 # 作者: Gemini 2.5 Pro
-# 版本: 1.0.7
+# 版本: 1.2.2
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -71,19 +71,16 @@ install_dependencies() {
     local cmd
     print_info "正在检查并安装依赖..."
     
-    # 检查通用命令
     for cmd in $required_commands; do
         if ! command_exists "$cmd"; then
             packages_to_install="$packages_to_install $cmd"
         fi
     done
 
-    # 针对 Certbot 和其 Nginx 插件进行更精确的检查
     if [ "$OS_TYPE" = "debian" ]; then
         if ! command_exists "certbot"; then
              packages_to_install="$packages_to_install certbot"
         fi
-        # 无论 certbot 是否存在，都检查 nginx 插件
         if ! dpkg-query -W -f='${Status}' python3-certbot-nginx 2>/dev/null | grep -q "ok installed"; then
             packages_to_install="$packages_to_install python3-certbot-nginx"
         fi
@@ -91,7 +88,6 @@ install_dependencies() {
         if ! command_exists "certbot"; then
              packages_to_install="$packages_to_install certbot"
         fi
-        # 检查 Alpine 的 nginx 插件
         if ! apk info -e certbot-nginx >/dev/null 2>&1; then
             packages_to_install="$packages_to_install certbot-nginx"
         fi
@@ -160,20 +156,44 @@ get_resolved_ip() {
     return 1
 }
 
-# --- 核心 Nginx & Certbot 操作 ---
-apply_nginx_config() {
-    local nginx_running=1
-    local nginx_reload_output
-    local start_output
-    local start_success=1
+check_port_80() {
+    print_info "正在检查 80 端口是否被占用..."
+    if command_exists ss; then
+        if ss -tlpn | grep -q ':80 '; then
+            print_warning "检测到 80 端口已被占用。请先停止占用该端口的服务。"
+            ss -tlpn | grep ':80 '
+            return 1
+        fi
+    elif command_exists netstat; then
+        if netstat -tlpn | grep -q ':80 '; then
+            print_warning "检测到 80 端口已被占用。请先停止占用该端口的服务。"
+            netstat -tlpn | grep ':80 '
+            return 1
+        fi
+    else
+        print_warning "无法检测端口占用情况 (缺少 ss 或 netstat 命令)。"
+    fi
+    print_success "80 端口可供使用。"
+    return 0
+}
+
+is_nginx_running() {
     if [ "$OS_TYPE" = "debian" ]; then
-        systemctl is-active --quiet "$NGINX_SERVICE" || nginx_running=0
+        systemctl is-active --quiet "$NGINX_SERVICE"
+        return $?
     elif [ "$OS_TYPE" = "alpine" ]; then
         rc-service "$NGINX_SERVICE" status >/dev/null 2>&1
-        if [ $? -eq 3 ]; then nginx_running=0; fi
+        if [ $? -eq 0 ]; then return 0; else return 1; fi
     fi
+    return 1
+}
 
-    if [ "$nginx_running" -eq 1 ]; then
+# --- 核心 Nginx & Certbot 操作 ---
+apply_nginx_config() {
+    local nginx_reload_output
+    local start_output
+    
+    if is_nginx_running; then
         print_info "正在重新加载 Nginx 配置..."
         nginx_reload_output=$(nginx -s reload 2>&1)
         if [ $? -eq 0 ]; then
@@ -186,19 +206,23 @@ apply_nginx_config() {
         fi
     else
         print_warning "Nginx 未在运行，尝试启动..."
+        if ! check_port_80; then return 1; fi
+        
         start_output=""
         if [ "$OS_TYPE" = "debian" ]; then
-            start_output=$(systemctl start "$NGINX_SERVICE" 2>&1) || start_success=0
+            systemctl start "$NGINX_SERVICE" >/dev/null 2>&1
         elif [ "$OS_TYPE" = "alpine" ]; then
-            start_output=$(rc-service "$NGINX_SERVICE" start 2>&1) || start_success=0
+            rc-service "$NGINX_SERVICE" start >/dev/null 2>&1
         fi
 
-        if [ "$start_success" -eq 1 ]; then
+        if is_nginx_running; then
             print_success "Nginx 已成功启动。"
             return 0
         else
             printf '%b\n' "${RED}[ERROR] Nginx 启动失败！${NC}" >&2
-            printf "\n--- Nginx 错误信息 ---\n%s\n-----------------------\n" "$start_output" >&2
+            if [ -n "$start_output" ]; then
+                printf "\n--- Nginx 错误信息 ---\n%s\n-----------------------\n" "$start_output" >&2
+            fi
             return 1
         fi
     fi
@@ -206,7 +230,16 @@ apply_nginx_config() {
 
 create_new_proxy() {
     disable_default_nginx_site
-    get_user_input
+    if ! get_user_input; then
+        print_info "用户取消输入，操作中止。"
+        return
+    fi
+    
+    if ! is_nginx_running; then
+        if ! check_port_80; then
+            print_error "端口检查失败，无法继续。"
+        fi
+    fi
     
     configure_nginx_http
     
@@ -242,7 +275,8 @@ create_new_proxy() {
     fi
 
     if request_ssl_certificate; then
-        print_info "正在针对新域名 ${PRIMARY_DOMAIN} 测试证书自动续期功能...";
+        enable_hsts_prompt
+        print_info "正在测试证书自动续期功能...";
         if ! certbot renew --dry-run --cert-name "$PRIMARY_DOMAIN"; then
             print_warning "针对 ${PRIMARY_DOMAIN} 的续期测试失败。但这不影响当前证书使用。"
         else
@@ -290,13 +324,22 @@ get_user_input() {
     
     print_info "请输入以下配置信息:"
     while true; do
-        printf "请输入您的域名 (多个域名请用空格分隔):\n(例如: yourdomain.com www.yourdomain.com): "; read -r ALL_DOMAINS_STR
-
+        printf "请输入您的域名 (多个域名请用空格分隔，输入 'q' 退出):\n(例如: yourdomain.com www.yourdomain.com): "; read -r ALL_DOMAINS_STR
+        
+        if [ "$ALL_DOMAINS_STR" = "q" ]; then return 1; fi
         if [ -z "$ALL_DOMAINS_STR" ]; then print_warning "域名不能为空，请重新输入。"; continue; fi
         
+        all_domains_valid=1
+        for domain in $ALL_DOMAINS_STR; do
+            if ! echo "$domain" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
+                print_warning "域名 '$domain' 格式无效，请重新输入所有域名。"
+                all_domains_valid=0
+                break
+            fi
+        done
+        if [ "$all_domains_valid" -eq 0 ]; then continue; fi
+
         PRIMARY_DOMAIN=$(echo "$ALL_DOMAINS_STR" | awk '{print $1}')
-        
-        if ! echo "$PRIMARY_DOMAIN" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then print_warning "列表中的第一个域名 '$PRIMARY_DOMAIN' 格式无效。"; continue; fi
         
         if [ "$OS_TYPE" = "debian" ]; then nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"; 
         else nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"; fi
@@ -367,6 +410,7 @@ get_user_input() {
             echo "$EMAIL" > "$CONF_FILE" || print_warning "无法保存邮箱地址到 $CONF_FILE"; break
         else print_warning "邮箱地址格式无效。"; fi
     done
+    return 0
 }
 
 configure_nginx_http() {
@@ -421,12 +465,11 @@ request_ssl_certificate() {
 
             printf "是否立即为以上域名申请真实证书? (Y/n): "; read -r choice
             case "$choice" in
-                [Nn]) return 1 ;; # 用户在测试后取消
-                *) ;; # 继续
+                [Nn]) return 1 ;;
+                *) ;;
             esac
             ;;
         *)
-            # 用户跳过测试，直接进入真实申请
             ;;
     esac
 
@@ -449,21 +492,13 @@ get_all_proxy_domains() {
     if [ "$OS_TYPE" = "debian" ]; then nginx_conf_dir="/etc/nginx/sites-available";
     else nginx_conf_dir="/etc/nginx/http.d"; fi
     
-    for conf_file in $(find "$nginx_conf_dir" -type f -name "*.conf" 2>/dev/null); do
+    for conf_file in $(find "$nginx_conf_dir" -type f \( -name "*.conf" -o -name "*.conf.disabled" \) 2>/dev/null); do
         if grep -q "Auto-generated by auto_nginx_ssl.sh" "$conf_file"; then
             domain=$(basename "$conf_file" .conf)
+            domain=$(basename "$domain" .conf.disabled)
             case " $domain_list " in *" $domain "*) ;; *) domain_list="$domain_list $domain" ;; esac
         fi
     done
-    
-    if [ "$OS_TYPE" = "alpine" ]; then
-        for conf_file in $(find "$nginx_conf_dir" -type f -name "*.conf.disabled" 2>/dev/null); do
-            if grep -q "Auto-generated by auto_nginx_ssl.sh" "$conf_file"; then
-                domain=$(basename "$conf_file" .conf.disabled)
-                case " $domain_list " in *" $domain "*) ;; *) domain_list="$domain_list $domain" ;; esac
-            fi
-        done
-    fi
 
     echo "$domain_list" | sed 's/^ *//'
 }
@@ -528,14 +563,16 @@ manage_single_proxy_menu() {
         fi
         
         printf "请选择操作:\n"; printf "  1) %s\n" "$toggle_action_text"
-        printf "  2) 修改反代目标\n"; printf "  3) %b\n" "${RED}删除配置${NC}"; printf "  4) 返回上一级\n"
-        printf "请输入选项 [1-4]: "; read -r sub_choice
+        printf "  2) 修改反代目标\n"; printf "  3) 手动续期证书\n"
+        printf "  4) %b\n" "${RED}删除配置${NC}"; printf "  5) 返回上一级\n"
+        printf "请输入选项 [1-5]: "; read -r sub_choice
 
         case "$sub_choice" in
             1) toggle_proxy_status "$domain" "$is_active"; break ;;
             2) modify_proxy_target "$domain"; break ;;
-            3) delete_proxy "$domain"; break;;
-            4) break;;
+            3) renew_certificate "$domain"; break;;
+            4) delete_proxy "$domain"; break;;
+            5) break;;
             *) print_warning "无效的选项。"; sleep 2;;
         esac
     done
@@ -596,7 +633,6 @@ modify_proxy_target() {
     sleep 2
 }
 
-
 toggle_proxy_status() {
     local domain="$1"
     local is_active="$2"
@@ -623,10 +659,10 @@ toggle_proxy_status() {
         if [ "$is_active" -eq 1 ]; then print_success "'$domain' 已暂停。"; else print_success "'$domain' 已恢复。"; fi
     else
         print_warning "正在回滚文件系统更改以保持状态一致..."
-        if [ "$is_active" -eq 1 ]; then # 暂停失败，需要恢复
+        if [ "$is_active" -eq 1 ]; then
             if [ "$OS_TYPE" = "debian" ]; then ln -s "/etc/nginx/sites-available/$domain.conf" "/etc/nginx/sites-enabled/";
             else mv "/etc/nginx/http.d/$domain.conf.disabled" "/etc/nginx/http.d/$domain.conf"; fi
-        else # 恢复失败，需要暂停
+        else
             if [ "$OS_TYPE" = "debian" ]; then rm -f "/etc/nginx/sites-enabled/$domain.conf";
             else mv "/etc/nginx/http.d/$domain.conf" "/etc/nginx/http.d/$domain.conf.disabled"; fi
         fi
@@ -672,6 +708,99 @@ delete_proxy() {
     esac
 }
 
+renew_certificate() {
+    local domain="$1"
+    local choice
+    print_info "为域名 ${domain} 手动续期证书..."
+    printf "是否先执行一次安全的续期测试 (dry-run)? (y/N): "; read -r choice
+    case "$choice" in
+        [Yy])
+            print_info "正在执行续期测试 (dry-run)..."
+            if ! certbot renew --dry-run --cert-name "$domain"; then
+                print_warning "续期测试失败。请检查错误信息。"
+                sleep 2; return
+            fi
+            print_success "续期测试成功！"
+            ;;
+    esac
+
+    printf "是否立即为 ${domain} 续期真实证书? (Y/n): "; read -r choice
+    case "$choice" in
+        [Nn]) print_info "操作已取消。"; sleep 2; return ;;
+    esac
+
+    print_info "正在执行真实证书续期..."
+    if certbot renew --cert-name "$domain" --deploy-hook "nginx -s reload"; then
+        print_success "证书续期成功，Nginx 已自动重载。"
+    else
+        print_warning "证书续期失败。"
+    fi
+    sleep 2
+}
+
+enable_hsts_prompt() {
+    local choice
+    printf "\n"
+    print_info "HSTS (HTTP Strict Transport Security) 是一项重要的安全功能，可以防止中间人攻击。"
+    printf "是否为 ${PRIMARY_DOMAIN} 开启 HSTS？ (y/N): "; read -r choice
+    case "$choice" in
+        [Yy])
+            enable_hsts "$PRIMARY_DOMAIN"
+            ;;
+        *)
+            print_info "已跳过开启 HSTS。"
+            ;;
+    esac
+}
+
+enable_hsts() {
+    local domain="$1"
+    local conf_path
+    local nginx_test_output
+    local hsts_header
+
+    print_info "正在为 ${domain} 开启 HSTS..."
+    if [ "$OS_TYPE" = "debian" ]; then
+        conf_path="/etc/nginx/sites-available/${domain}.conf"
+    else
+        conf_path="/etc/nginx/http.d/${domain}.conf"
+    fi
+
+    if [ ! -f "$conf_path" ]; then
+        print_warning "找不到配置文件: ${conf_path}"
+        sleep 2; return
+    fi
+
+    if grep -q "Strict-Transport-Security" "$conf_path"; then
+        print_warning "HSTS 配置已存在。"
+        sleep 2; return
+    fi
+    
+    hsts_header='"max-age=31536000" always;'
+
+    cp "$conf_path" "$conf_path.bak"
+    # 在 ssl_certificate_key 后面添加 HSTS header
+    sed -i "/ssl_certificate_key/a \        add_header Strict-Transport-Security ${hsts_header}" "$conf_path"
+
+    nginx_test_output=$(nginx -t 2>&1)
+    if [ $? -eq 0 ]; then
+        if apply_nginx_config; then
+            print_success "HSTS 已成功开启。"
+        else
+            print_warning "未能应用 HSTS 配置！正在回滚..."
+            mv "$conf_path.bak" "$conf_path"
+            print_warning "HSTS 配置已回滚。"
+            apply_nginx_config
+        fi
+    else
+        printf '%b\n' "${RED}[ERROR] HSTS 配置未能通过 Nginx 测试！正在回滚...${NC}" >&2
+        printf "\n--- Nginx 错误信息 ---\n%s\n-----------------------\n" "$nginx_test_output" >&2
+        mv "$conf_path.bak" "$conf_path"
+        print_warning "HSTS 配置已回滚。"
+    fi
+    sleep 2
+}
+
 # --- 脚本主入口 ---
 main() {
     local choice
@@ -701,3 +830,4 @@ main() {
 }
 
 main
+
