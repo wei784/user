@@ -5,7 +5,7 @@
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
 # 作者: Gemini 2.5 Pro
-# 版本: 1.2.2
+# 版本: 1.2.3
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -463,7 +463,7 @@ request_ssl_certificate() {
             fi
             print_success "证书申请测试成功！"
 
-            printf "是否立即为以上域名申请证书? (Y/n): "; read -r choice
+            printf "是否立即为以上域名申请真实证书? (Y/n): "; read -r choice
             case "$choice" in
                 [Nn]) return 1 ;;
                 *) ;;
@@ -473,10 +473,10 @@ request_ssl_certificate() {
             ;;
     esac
 
-    print_info "正在申请 SSL 证书 (服务将自动重载)..."
+    print_info "正在申请真实 SSL 证书 (服务将自动重载)..."
     # shellcheck disable=SC2086
     if ! certbot --nginx --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring --redirect; then
-        print_warning "证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
+        print_warning "真实证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
         return 1
     fi
     print_success "SSL 证书已成功申请并配置！"
@@ -562,17 +562,20 @@ manage_single_proxy_menu() {
             printf "当前状态: %b\n\n" "${YELLOW}已暂停${NC}"; toggle_action_text="恢复"
         fi
         
-        printf "请选择操作:\n"; printf "  1) %s\n" "$toggle_action_text"
-        printf "  2) 修改反代目标\n"; printf "  3) 手动续期证书\n"
-        printf "  4) %b\n" "${RED}删除配置${NC}"; printf "  5) 返回上一级\n"
+        printf "请选择操作:\n"
+        printf "  1) %s\n" "$toggle_action_text"
+        printf "  2) 修改反代目标\n"
+        printf "  3) 手动续期证书\n"
+        printf "  4) %b\n" "${RED}删除配置${NC}"
+        printf "  5) 返回上一级\n"
         printf "请输入选项 [1-5]: "; read -r sub_choice
 
         case "$sub_choice" in
             1) toggle_proxy_status "$domain" "$is_active"; break ;;
             2) modify_proxy_target "$domain"; break ;;
-            3) renew_certificate "$domain"; break;;
-            4) delete_proxy "$domain"; break;;
-            5) break;;
+            3) renew_certificate "$domain"; break ;;
+            4) delete_proxy "$domain"; break ;;
+            5) break ;;
             *) print_warning "无效的选项。"; sleep 2;;
         esac
     done
@@ -724,14 +727,16 @@ renew_certificate() {
             ;;
     esac
 
-    printf "是否立即为 ${domain} 续期证书? (Y/n): "; read -r choice
+    printf "是否立即为 ${domain} 续期真实证书? (Y/n): "; read -r choice
     case "$choice" in
         [Nn]) print_info "操作已取消。"; sleep 2; return ;;
     esac
 
-    print_info "正在执行证书续期..."
-    if certbot renew --cert-name "$domain" --deploy-hook "nginx -s reload"; then
-        print_success "证书续期成功，Nginx 已自动重载。"
+    print_info "正在执行真实证书续期..."
+    if certbot renew --cert-name "$domain"; then
+        print_success "Certbot 续期命令执行成功。"
+	print_info "正在重新加载 Nginx 以确保配置生效..."
+	apply_nginx_config
     else
         print_warning "证书续期失败。"
     fi
