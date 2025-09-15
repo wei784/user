@@ -5,7 +5,7 @@
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
 # 作者: Gemini 2.5 Pro
-# 版本: 1.0.1
+# 版本: 1.0.6
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -51,6 +51,7 @@ check_privileges() {
 }
 
 detect_os() {
+    local OS_ID=""
     if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID=$ID;
     elif type lsb_release >/dev/null 2>&1; then OS_ID=$(lsb_release -si | tr '[:upper:]' '[:lower:]');
     elif [ -f /etc/debian_version ]; then OS_ID="debian";
@@ -65,26 +66,35 @@ detect_os() {
 }
 
 install_dependencies() {
+    local packages_to_install=""
+    local required_commands="nginx curl openssl"
+    local cmd
     print_info "正在检查并安装依赖..."
-    packages_to_install=""
-    required_commands="nginx certbot curl openssl"
+    
+    # 检查通用命令
+    for cmd in $required_commands; do
+        if ! command_exists "$cmd"; then
+            packages_to_install="$packages_to_install $cmd"
+        fi
+    done
+
+    # 针对 Certbot 和其 Nginx 插件进行更精确的检查
     if [ "$OS_TYPE" = "debian" ]; then
-        for cmd in $required_commands; do
-            if ! command_exists "$cmd"; then
-                case "$cmd" in
-                    nginx) packages_to_install="$packages_to_install nginx" ;;
-                    certbot) packages_to_install="$packages_to_install certbot python3-certbot-nginx" ;;
-                    curl) packages_to_install="$packages_to_install curl" ;;
-                    openssl) packages_to_install="$packages_to_install openssl" ;;
-                esac
-            fi
-        done
+        if ! command_exists "certbot"; then
+             packages_to_install="$packages_to_install certbot"
+        fi
+        # 无论 certbot 是否存在，都检查 nginx 插件
+        if ! dpkg-query -W -f='${Status}' python3-certbot-nginx 2>/dev/null | grep -q "ok installed"; then
+            packages_to_install="$packages_to_install python3-certbot-nginx"
+        fi
     elif [ "$OS_TYPE" = "alpine" ]; then
-        for cmd in $required_commands; do
-            if ! command_exists "$cmd"; then
-                packages_to_install="$packages_to_install $cmd"
-            fi
-        done
+        if ! command_exists "certbot"; then
+             packages_to_install="$packages_to_install certbot"
+        fi
+        # 检查 Alpine 的 nginx 插件
+        if ! apk info -e certbot-nginx >/dev/null 2>&1; then
+            packages_to_install="$packages_to_install certbot-nginx"
+        fi
     fi
 
     packages_to_install=$(echo "$packages_to_install" | sed 's/^ *//')
@@ -104,7 +114,6 @@ install_dependencies() {
     fi
 }
 
-# 禁用 Nginx 自带的默认欢迎页面，避免冲突
 disable_default_nginx_site() {
     if [ "$OS_TYPE" = "debian" ]; then
         if [ -L /etc/nginx/sites-enabled/default ]; then
@@ -121,10 +130,11 @@ disable_default_nginx_site() {
     fi
 }
 
-
-# --- 网络检查函数 (增强) ---
+# --- 网络检查函数 ---
 get_server_ip() {
-    ip_services="ifconfig.me ip.sb api.ipify.org ipinfo.io/ip"
+    local ip_services="ifconfig.me ip.sb api.ipify.org ipinfo.io/ip"
+    local service
+    local ip
     for service in $ip_services; do
         ip=$(curl -s --connect-timeout 3 "$service")
         if echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
@@ -136,8 +146,10 @@ get_server_ip() {
 }
 
 get_resolved_ip() {
-    domain="$1"
-    doh_services="https://dns.google/resolve https://dns.alidns.com/resolve"
+    local domain="$1"
+    local doh_services="https://dns.google/resolve https://dns.alidns.com/resolve"
+    local service
+    local resolved_ip
     for service in $doh_services; do
         resolved_ip=$(curl -s --max-time 1 "${service}?name=$domain&type=A" | grep -o '"data":"[^"]*' | head -n1 | cut -d'"' -f4)
         if [ -n "$resolved_ip" ]; then
@@ -148,12 +160,12 @@ get_resolved_ip() {
     return 1
 }
 
-# --- 核心功能 ---
-
-# 新增: 智能地重载或启动 Nginx
-# 返回 0 表示成功, 1 表示失败
+# --- 核心 Nginx & Certbot 操作 ---
 apply_nginx_config() {
-    nginx_running=1
+    local nginx_running=1
+    local nginx_reload_output
+    local start_output
+    local start_success=1
     if [ "$OS_TYPE" = "debian" ]; then
         systemctl is-active --quiet "$NGINX_SERVICE" || nginx_running=0
     elif [ "$OS_TYPE" = "alpine" ]; then
@@ -175,7 +187,6 @@ apply_nginx_config() {
     else
         print_warning "Nginx 未在运行，尝试启动..."
         start_output=""
-        start_success=1
         if [ "$OS_TYPE" = "debian" ]; then
             start_output=$(systemctl start "$NGINX_SERVICE" 2>&1) || start_success=0
         elif [ "$OS_TYPE" = "alpine" ]; then
@@ -193,45 +204,100 @@ apply_nginx_config() {
     fi
 }
 
-
-# --- 功能一: 创建新配置 ---
 create_new_proxy() {
     disable_default_nginx_site
     get_user_input
-    request_ssl_certificate
-    configure_nginx
-    finalize_setup
     
-    printf '\n'; print_success "所有操作已成功完成!"
-    printf '%b\n' "-----------------------------------------------------"
-    printf '%b\n' "您的网站 ${YELLOW}${PRIMARY_DOMAIN}${NC} 现已配置完成并通过 HTTPS 访问。"
-    printf '%b\n' "Nginx 将流量反向代理到: ${YELLOW}${PROXY_PASS}${NC}"
-    if [ "$OS_TYPE" = "debian" ]; then
-        printf '%b\n' "Nginx 配置文件位于: ${YELLOW}/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf${NC}"
-    else
-        printf '%b\n' "Nginx 配置文件位于: ${YELLOW}/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf${NC}"
+    configure_nginx_http
+    
+    local nginx_test_output
+    local nginx_conf_path
+    nginx_test_output=$(nginx -t 2>&1)
+    if [ $? -ne 0 ]; then
+        printf '%b\n' "${RED}[ERROR] 生成的初始 Nginx HTTP 配置无效！${NC}" >&2
+        printf "\n--- Nginx 错误信息 ---\n%s\n-----------------------\n" "$nginx_test_output" >&2
+        
+        print_warning "正在清理无效的配置文件..."
+        if [ "$OS_TYPE" = "debian" ]; then 
+            nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"
+            rm -f "/etc/nginx/sites-enabled/${PRIMARY_DOMAIN}.conf"
+        else 
+            nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"
+        fi
+        rm -f "$nginx_conf_path"
+        print_warning "清理完成。"
+        return 1
     fi
-    printf '%b\n' "SSL 证书文件位于: ${YELLOW}/etc/letsencrypt/live/${PRIMARY_DOMAIN}/${NC}"
-    printf '%b\n' "-----------------------------------------------------"; printf '\n'
+
+    if ! apply_nginx_config; then
+        print_warning "应用初始 Nginx HTTP 配置失败，正在清理残留文件..."
+        if [ "$OS_TYPE" = "debian" ]; then 
+             nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"
+             rm -f "/etc/nginx/sites-enabled/${PRIMARY_DOMAIN}.conf"
+        else 
+             nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"
+        fi
+        rm -f "$nginx_conf_path"
+        print_error "应用初始 Nginx HTTP 配置失败，操作已中止并清理。"
+    fi
+
+    if request_ssl_certificate; then
+        print_info "正在针对新域名 ${PRIMARY_DOMAIN} 测试证书自动续期功能...";
+        if ! certbot renew --dry-run --cert-name "$PRIMARY_DOMAIN"; then
+            print_warning "针对 ${PRIMARY_DOMAIN} 的续期测试失败。但这不影响当前证书使用。"
+        else
+            print_success "证书自动续期配置正常。"
+        fi
+
+        printf '\n'; print_success "所有操作已成功完成!"
+        printf '%b\n' "-----------------------------------------------------"
+        printf '%b\n' "您的网站 ${YELLOW}${PRIMARY_DOMAIN}${NC} 现已配置完成并通过 HTTPS 访问。"
+        printf '%b\n' "Nginx 将流量反向代理到: ${YELLOW}${PROXY_PASS}${NC}"
+        if [ "$OS_TYPE" = "debian" ]; then
+            printf '%b\n' "Nginx 配置文件位于: ${YELLOW}/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf${NC}"
+        else
+            printf '%b\n' "Nginx 配置文件位于: ${YELLOW}/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf${NC}"
+        fi
+        printf '%b\n' "SSL 证书文件位于: ${YELLOW}/etc/letsencrypt/live/${PRIMARY_DOMAIN}/${NC}"
+        printf '%b\n' "-----------------------------------------------------"; printf '\n'
+    else
+        print_info "SSL 证书申请失败或已取消，正在清理初始配置..."
+        if [ "$OS_TYPE" = "debian" ]; then 
+             nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"
+             rm -f "/etc/nginx/sites-enabled/${PRIMARY_DOMAIN}.conf"
+        else 
+             nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"
+        fi
+        rm -f "$nginx_conf_path"
+        
+        apply_nginx_config || print_warning "重新加载 Nginx 配置失败，可能需要手动检查。"
+        print_info "操作已中止，并已清理残留的 HTTP 配置。"
+    fi
 }
 
 get_user_input() {
+    local nginx_conf_path
+    local choice
+    local server_ip
+    local resolved_ip
+    local protocol
+    local address
+    local original_address
+    local port
+    local last_email
+    local all_domains_valid
+    local domain
+    
     print_info "请输入以下配置信息:"
-    # 获取域名
     while true; do
         printf "请输入您的域名 (多个域名请用空格分隔):\n(例如: yourdomain.com www.yourdomain.com): "; read -r ALL_DOMAINS_STR
 
-        if [ -z "$ALL_DOMAINS_STR" ]; then
-            print_warning "域名不能为空，请重新输入。"; continue
-        fi
+        if [ -z "$ALL_DOMAINS_STR" ]; then print_warning "域名不能为空，请重新输入。"; continue; fi
         
         PRIMARY_DOMAIN=$(echo "$ALL_DOMAINS_STR" | awk '{print $1}')
         
-        if ! echo "$PRIMARY_DOMAIN" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then
-            print_warning "列表中的第一个域名 '$PRIMARY_DOMAIN' 格式无效，请重新输入。"; continue
-        fi
+        if ! echo "$PRIMARY_DOMAIN" | grep -qE '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'; then print_warning "列表中的第一个域名 '$PRIMARY_DOMAIN' 格式无效。"; continue; fi
         
-        nginx_conf_path=""
         if [ "$OS_TYPE" = "debian" ]; then nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"; 
         else nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"; fi
 
@@ -250,29 +316,35 @@ get_user_input() {
         if [ -z "$server_ip" ]; then
             print_warning "无法自动获取服务器公网IP。请手动确认您的域名解析正确。"
         else
-            resolved_ip=$(get_resolved_ip "$PRIMARY_DOMAIN")
-            if [ "$resolved_ip" = "$server_ip" ]; then
-                print_success "主域名 ($PRIMARY_DOMAIN) 已成功解析到本机 IP ($server_ip)。"
-            else
-                print_warning "主域名 ($PRIMARY_DOMAIN) 解析的 IP ($resolved_ip) 与本机 IP ($server_ip) 不匹配。"
-                printf "是否继续? (y/n): "; read -r choice
-                case "$choice" in [Yy]) ;; *) continue ;; esac
+            print_info "正在验证所有域名的 DNS A 记录..."
+            all_domains_valid=1
+            for domain in $ALL_DOMAINS_STR; do
+                resolved_ip=$(get_resolved_ip "$domain")
+                if [ "$resolved_ip" = "$server_ip" ]; then
+                    print_success "域名 ($domain) -> ${GREEN}匹配${NC} ($server_ip)"
+                else
+                    print_warning "域名 ($domain) -> ${RED}不匹配${NC} (解析到: $resolved_ip, 需要: $server_ip)"
+                    all_domains_valid=0
+                fi
+            done
+            
+            if [ "$all_domains_valid" -eq 0 ]; then
+                printf "一个或多个域名解析不正确。是否继续? (y/n): "
+                read -r choice
+                case "$choice" in
+                    [Yy]) ;;
+                    *) continue ;;
+                esac
             fi
         fi
         break
     done
     
-    # 获取协议
     while true; do
         printf "请选择反向代理目标的协议 [http/https] (默认: http): "; read -r protocol; protocol=${protocol:-http}
-        if [ "$protocol" = "http" ] || [ "$protocol" = "https" ]; then
-            break
-        else
-            print_warning "输入无效，请输入 http 或 https。"
-        fi
+        if [ "$protocol" = "http" ] || [ "$protocol" = "https" ]; then break; else print_warning "输入无效，请输入 http 或 https。"; fi
     done
     
-    # 获取反向代理目标地址
     while true; do
         printf "请输入反向代理的目标地址 (例如: 127.0.0.1:8080 或仅输入端口 8080): "; read -r address
         if [ -z "$address" ]; then print_warning "目标地址不能为空。"; continue; fi
@@ -287,7 +359,6 @@ get_user_input() {
     
     PROXY_PASS="${protocol}://${address}"; print_info "反向代理目标地址已设置为: ${PROXY_PASS}"
     
-    # 获取邮箱
     last_email=""; if [ -f "$CONF_FILE" ]; then last_email=$(cat "$CONF_FILE"); fi
     while true; do
         if [ -n "$last_email" ]; then printf "请输入您的邮箱地址 [默认: %s]: " "$last_email"; else printf "请输入您的邮箱地址: "; fi
@@ -296,71 +367,13 @@ get_user_input() {
             echo "$EMAIL" > "$CONF_FILE" || print_warning "无法保存邮箱地址到 $CONF_FILE"; break
         else print_warning "邮箱地址格式无效。"; fi
     done
-
-    TEST_MODE="no"; printf "是否以测试模式运行 Certbot (dry-run)? [y/N]: "; read -r test_choice
-    case "$test_choice" in [Yy]) TEST_MODE="yes"; print_info "Certbot 将以测试模式运行。";; *) print_info "Certbot 将以生产模式运行。";; esac
 }
 
-request_ssl_certificate() {
-    print_info "正在为域名 $ALL_DOMAINS_STR 申请 SSL 证书..."
-    
-    certbot_domain_flags=""
-    for domain in $ALL_DOMAINS_STR; do
-        certbot_domain_flags="$certbot_domain_flags -d $domain"
-    done
-
-    dry_run_flag=""
-    if [ "$TEST_MODE" = "yes" ]; then dry_run_flag="--dry-run"; print_info "执行 Certbot 测试运行..."; fi
-    
-    print_info "正在临时停止 Nginx 服务..."; if [ "$OS_TYPE" = "debian" ]; then systemctl stop "$NGINX_SERVICE"; else rc-service "$NGINX_SERVICE" stop; fi
-    
-    # shellcheck disable=SC2086
-    certbot certonly --standalone $dry_run_flag --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring
-    
-    if [ $? -ne 0 ]; then
-        if [ "$OS_TYPE" = "debian" ]; then systemctl start "$NGINX_SERVICE"; else rc-service "$NGINX_SERVICE" start; fi
-        print_error "SSL 证书申请失败。请检查各项配置。"
-    fi
-    if [ "$TEST_MODE" = "yes" ]; then
-        print_success "Certbot 测试运行成功！"; print_info "请在无测试模式下重新运行脚本以申请真实证书。"
-        if [ "$OS_TYPE" = "debian" ]; then systemctl start "$NGINX_SERVICE"; else rc-service "$NGINX_SERVICE" start; fi
-        exit 0
-    fi
-    print_success "SSL 证书已成功申请。"
-    
-    renewal_conf="/etc/letsencrypt/renewal/${PRIMARY_DOMAIN}.conf"
-    if [ -f "$renewal_conf" ]; then
-        print_info "正在为证书配置自动续订挂钩..."
-        if [ "$OS_TYPE" = "debian" ]; then
-            pre_hook_cmd="systemctl stop $NGINX_SERVICE"; post_hook_cmd="systemctl start $NGINX_SERVICE"
-        else
-            pre_hook_cmd="rc-service $NGINX_SERVICE stop"; post_hook_cmd="rc-service $NGINX_SERVICE start"
-        fi
-        if ! grep -q -E "^\s*pre_hook" "$renewal_conf"; then sed -i "/\[renewalparams\]/a pre_hook = $pre_hook_cmd" "$renewal_conf"; fi
-        if ! grep -q -E "^\s*post_hook" "$renewal_conf"; then sed -i "/\[renewalparams\]/a post_hook = $post_hook_cmd" "$renewal_conf"; fi
-        print_success "续订挂钩已成功配置。"
-    fi
-}
-
-configure_nginx() {
-    print_info "正在生成 Nginx 配置文件..."
+configure_nginx_http() {
+    local nginx_conf_path
+    print_info "正在生成初始 Nginx HTTP 配置文件..."
     if [ "$OS_TYPE" = "debian" ]; then nginx_conf_path="/etc/nginx/sites-available/${PRIMARY_DOMAIN}.conf"; else nginx_conf_path="/etc/nginx/http.d/${PRIMARY_DOMAIN}.conf"; fi
-
-    current_nginx_version=$(get_nginx_version)
-    threshold_version="1.25.1" 
-    listen_http2_directive=""
-
-    if version_lt "$current_nginx_version" "$threshold_version"; then
-        print_info "检测到 Nginx 版本 ($current_nginx_version) < $threshold_version, 使用旧版 http2 语法。"
-        listen_http2_directive="    listen 443 ssl http2;
-    listen [::]:443 ssl http2;"
-    else
-        print_info "检测到 Nginx 版本 ($current_nginx_version) >= $threshold_version, 使用新版 http2 语法。"
-        listen_http2_directive="    listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;"
-    fi
-
+    
     cat > "$nginx_conf_path" << EOF
 # ${PRIMARY_DOMAIN} - Nginx Configuration
 # Auto-generated by auto_nginx_ssl.sh
@@ -368,23 +381,6 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${ALL_DOMAINS_STR};
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-server {
-${listen_http2_directive}
-    server_name ${ALL_DOMAINS_STR};
-    ssl_certificate /etc/letsencrypt/live/${PRIMARY_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${PRIMARY_DOMAIN}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL_${PRIMARY_DOMAIN}:10m;
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     location / {
         proxy_pass ${PROXY_PASS};
         proxy_set_header Host \$host;
@@ -401,29 +397,56 @@ EOF
     if [ "$OS_TYPE" = "debian" ]; then
         if [ ! -L "/etc/nginx/sites-enabled/${PRIMARY_DOMAIN}.conf" ]; then ln -s "$nginx_conf_path" "/etc/nginx/sites-enabled/"; fi
     fi
-    print_success "Nginx 配置文件已生成: ${nginx_conf_path}"
-    nginx -t || print_error "Nginx 配置测试失败。"
+    print_success "Nginx HTTP 配置文件已生成: ${nginx_conf_path}"
 }
 
-finalize_setup() {
-    apply_nginx_config || print_error "Nginx 启动或重载失败。"
+request_ssl_certificate() {
+    local certbot_domain_flags=""
+    local domain
+    local choice
     
-    print_info "正在针对新域名 ${PRIMARY_DOMAIN} 测试证书自动续期功能...";
-    certbot renew --dry-run --cert-name "$PRIMARY_DOMAIN"
-    if [ $? -ne 0 ]; then
-        print_warning "针对 ${PRIMARY_DOMAIN} 的续期测试失败。请关注邮箱通知。"
-    else
-        print_success "证书自动续期配置正常。"
+    print_info "为域名 $ALL_DOMAINS_STR 准备申请 SSL 证书..."
+    for domain in $ALL_DOMAINS_STR; do certbot_domain_flags="$certbot_domain_flags -d $domain"; done
+
+    printf "是否先执行一次安全的证书申请测试 (dry-run)? (y/N): "; read -r choice
+    case "$choice" in
+        [Yy])
+            print_info "正在执行证书申请测试 (dry-run)..."
+            # shellcheck disable=SC2086
+            if ! certbot certonly --nginx --dry-run --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring; then
+                print_error "证书申请测试失败。请检查 Certbot 输出的错误信息。"
+            fi
+            print_success "证书申请测试成功！"
+
+            printf "是否立即为以上域名申请真实证书? (Y/n): "; read -r choice
+            case "$choice" in
+                [Nn]) return 1 ;; # 用户在测试后取消
+                *) ;; # 继续
+            esac
+            ;;
+        *)
+            # 用户跳过测试，直接进入真实申请
+            ;;
+    esac
+
+    print_info "正在申请真实 SSL 证书 (服务将自动重载)..."
+    # shellcheck disable=SC2086
+    if ! certbot --nginx --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring --redirect; then
+        print_error "真实证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
     fi
+    print_success "SSL 证书已成功申请并配置！"
+    return 0
 }
 
 # --- 功能二: 管理已有配置 ---
 get_all_proxy_domains() {
-    nginx_conf_dir=""; domain_list=""
+    local nginx_conf_dir=""
+    local domain_list=""
+    local conf_file
+    local domain
     if [ "$OS_TYPE" = "debian" ]; then nginx_conf_dir="/etc/nginx/sites-available";
     else nginx_conf_dir="/etc/nginx/http.d"; fi
     
-    # shellcheck disable=SC2046
     for conf_file in $(find "$nginx_conf_dir" -type f -name "*.conf" 2>/dev/null); do
         if grep -q "Auto-generated by auto_nginx_ssl.sh" "$conf_file"; then
             domain=$(basename "$conf_file" .conf)
@@ -432,7 +455,6 @@ get_all_proxy_domains() {
     done
     
     if [ "$OS_TYPE" = "alpine" ]; then
-        # shellcheck disable=SC2046
         for conf_file in $(find "$nginx_conf_dir" -type f -name "*.conf.disabled" 2>/dev/null); do
             if grep -q "Auto-generated by auto_nginx_ssl.sh" "$conf_file"; then
                 domain=$(basename "$conf_file" .conf.disabled)
@@ -445,6 +467,13 @@ get_all_proxy_domains() {
 }
 
 manage_proxies_menu() {
+    local domain_list
+    local count
+    local domain
+    local status_text
+    local is_active
+    local choice
+    local selected_domain
     while true; do
         clear; print_info "管理已有的反向代理配置"
         domain_list=$(get_all_proxy_domains)
@@ -455,13 +484,12 @@ manage_proxies_menu() {
         count=0
         for domain in $domain_list; do
             count=$((count + 1))
-            status_text=""; is_active=0
+            is_active=0
             if [ "$OS_TYPE" = "debian" ]; then
                 if [ -L "/etc/nginx/sites-enabled/$domain.conf" ]; then is_active=1; fi
             else
                 if [ -f "/etc/nginx/http.d/$domain.conf" ]; then is_active=1; fi
             fi
-            
             if [ "$is_active" -eq 1 ]; then status_text="${GREEN}(运行中)${NC}"; else status_text="${YELLOW}(已暂停)${NC}"; fi
             printf "  %s) %-30s %b\n" "$count" "$domain" "$status_text"
         done
@@ -478,10 +506,13 @@ manage_proxies_menu() {
 }
 
 manage_single_proxy_menu() {
-    domain="$1"
+    local domain="$1"
+    local is_active
+    local toggle_action_text
+    local sub_choice
     while true; do
         clear; printf "正在管理域名: %b\n" "${YELLOW}$domain${NC}"; printf -- "----------------------------------------\n"
-        is_active=0; toggle_action_text=""
+        is_active=0;
         if [ "$OS_TYPE" = "debian" ]; then
             if [ -L "/etc/nginx/sites-enabled/$domain.conf" ]; then is_active=1; fi
         else
@@ -509,10 +540,18 @@ manage_single_proxy_menu() {
 }
 
 modify_proxy_target() {
-    domain="$1"
-    conf_path=""
+    local domain="$1"
+    local conf_path
+    local current_proxy_pass
+    local address
+    local original_address
+    local port
+    local protocol
+    local new_proxy_pass
+    local nginx_test_output
+
     if [ "$OS_TYPE" = "debian" ]; then conf_path="/etc/nginx/sites-available/$domain.conf"; else conf_path="/etc/nginx/http.d/$domain.conf"; fi
-    if [ ! -f "$conf_path" ]; then conf_path="${conf_path}.disabled"; fi # Also check for disabled conf
+    if [ ! -f "$conf_path" ]; then conf_path="${conf_path}.disabled"; fi
     if [ ! -f "$conf_path" ]; then print_warning "找不到配置文件: $domain"; sleep 2; return; fi
 
     current_proxy_pass=$(grep "proxy_pass" "$conf_path" | head -n 1 | sed -e 's/^[[:space:]]*proxy_pass[[:space:]]*//' -e 's/;//')
@@ -542,7 +581,6 @@ modify_proxy_target() {
              print_success "配置更新成功。"
              rm "$conf_path.bak"
         else
-            # apply_nginx_config already printed the error, now we just rollback
             print_warning "未能应用新的 Nginx 配置！正在回滚..."
             mv "$conf_path.bak" "$conf_path"
             print_warning "更改已回滚。"
@@ -558,9 +596,11 @@ modify_proxy_target() {
 
 
 toggle_proxy_status() {
-    domain="$1"; is_active="$2"
+    local domain="$1"
+    local is_active="$2"
+    local nginx_test_output
+    
     print_info "正在切换 '$domain' 的状态..."
-
     nginx_test_output=$(nginx -t 2>&1)
     if [ $? -ne 0 ]; then
         print_warning "Nginx 全局配置存在错误，无法继续操作。请先手动修复 Nginx 配置。"
@@ -580,7 +620,6 @@ toggle_proxy_status() {
     if apply_nginx_config; then
         if [ "$is_active" -eq 1 ]; then print_success "'$domain' 已暂停。"; else print_success "'$domain' 已恢复。"; fi
     else
-        # apply_nginx_config already printed the error
         print_warning "正在回滚文件系统更改以保持状态一致..."
         if [ "$is_active" -eq 1 ]; then # 暂停失败，需要恢复
             if [ "$OS_TYPE" = "debian" ]; then ln -s "/etc/nginx/sites-available/$domain.conf" "/etc/nginx/sites-enabled/";
@@ -595,11 +634,26 @@ toggle_proxy_status() {
 }
 
 delete_proxy() {
-    domain="$1"
+    local domain="$1"
+    local confirm
     printf "您确定要永久删除 '$domain' 的所有配置吗？(y/N): "; read -r confirm
     case "$confirm" in
         [Yy])
             print_info "正在删除 '$domain'..."
+            if command_exists certbot; then
+                print_info "第 1 步: 正在删除 SSL 证书..."
+                if ! certbot delete --cert-name "$domain" --non-interactive; then
+                    print_warning "Certbot 证书删除失败。可能是证书不存在或 Certbot 出错。"
+                    printf "是否仍要继续删除 Nginx 配置文件? (y/N): "
+                    read -r confirm_nginx_delete
+                    case "$confirm_nginx_delete" in
+                        [Yy]) ;;
+                        *) print_info "删除操作已中止。"; sleep 2; return ;;
+                    esac
+                fi
+            fi
+
+            print_info "第 2 步: 正在删除 Nginx 配置文件..."
             if [ "$OS_TYPE" = "debian" ]; then
                 rm -f "/etc/nginx/sites-enabled/$domain.conf"
                 rm -f "/etc/nginx/sites-available/$domain.conf"
@@ -607,13 +661,8 @@ delete_proxy() {
                 rm -f "/etc/nginx/http.d/$domain.conf"
                 rm -f "/etc/nginx/http.d/$domain.conf.disabled"
             fi
-            print_info "Nginx 配置文件已删除。"
+            print_success "Nginx 配置文件已删除。"
             
-            if command_exists certbot; then
-                print_info "正在删除 SSL 证书..."
-                certbot delete --cert-name "$domain" --non-interactive
-            fi
-
             apply_nginx_config || print_warning "Nginx 重载或启动失败，请稍后手动检查。"
             print_success "'$domain' 已被彻底删除。"; sleep 2
             ;;
@@ -623,6 +672,7 @@ delete_proxy() {
 
 # --- 脚本主入口 ---
 main() {
+    local choice
     check_privileges
     detect_os
     install_dependencies
