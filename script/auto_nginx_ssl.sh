@@ -5,7 +5,7 @@
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
 # 作者: Gemini 2.5 Pro
-# 版本: 1.0.6
+# 版本: 1.0.7
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -414,7 +414,8 @@ request_ssl_certificate() {
             print_info "正在执行证书申请测试 (dry-run)..."
             # shellcheck disable=SC2086
             if ! certbot certonly --nginx --dry-run --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring; then
-                print_error "证书申请测试失败。请检查 Certbot 输出的错误信息。"
+                print_warning "证书申请测试失败。请检查 Certbot 输出的错误信息。"
+                return 1
             fi
             print_success "证书申请测试成功！"
 
@@ -432,7 +433,8 @@ request_ssl_certificate() {
     print_info "正在申请真实 SSL 证书 (服务将自动重载)..."
     # shellcheck disable=SC2086
     if ! certbot --nginx --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring --redirect; then
-        print_error "真实证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
+        print_warning "真实证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
+        return 1
     fi
     print_success "SSL 证书已成功申请并配置！"
     return 0
@@ -699,4 +701,3 @@ main() {
 }
 
 main
-
