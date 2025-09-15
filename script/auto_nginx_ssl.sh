@@ -5,7 +5,7 @@
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
 # 作者: Gemini 2.5 Pro
-# 版本: 1.2.3
+# 版本: 1.2.4
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -31,17 +31,6 @@ print_success() { printf '%b\n' "${GREEN}[SUCCESS] $1${NC}"; }
 print_warning() { printf '%b\n' "${YELLOW}[WARNING] $1${NC}"; }
 print_error() { printf '%b\n' "${RED}[ERROR] $1${NC}" >&2; exit 1; }
 command_exists() { command -v "$1" >/dev/null 2>&1; }
-
-# 获取 Nginx 版本号
-get_nginx_version() {
-    nginx -v 2>&1 | grep "nginx version" | sed 's#^.*/##'
-}
-
-# 比较版本号，如果 $1 < $2 则返回 0 (true)
-version_lt() {
-    [ "$1" = "$2" ] && return 1
-    [ "$1" = "$(printf '%s\n%s' "$1" "$2" | sort -V | head -n 1)" ]
-}
 
 # --- 初始化和环境检查 ---
 check_privileges() {
@@ -210,9 +199,9 @@ apply_nginx_config() {
         
         start_output=""
         if [ "$OS_TYPE" = "debian" ]; then
-            systemctl start "$NGINX_SERVICE" >/dev/null 2>&1
+            start_output=$(systemctl start "$NGINX_SERVICE" 2>&1)
         elif [ "$OS_TYPE" = "alpine" ]; then
-            rc-service "$NGINX_SERVICE" start >/dev/null 2>&1
+            start_output=$(rc-service "$NGINX_SERVICE" start 2>&1)
         fi
 
         if is_nginx_running; then
@@ -463,7 +452,7 @@ request_ssl_certificate() {
             fi
             print_success "证书申请测试成功！"
 
-            printf "是否立即为以上域名申请证书? (Y/n): "; read -r choice
+            printf "是否立即为以上域名申请真实证书? (Y/n): "; read -r choice
             case "$choice" in
                 [Nn]) return 1 ;;
                 *) ;;
@@ -473,10 +462,10 @@ request_ssl_certificate() {
             ;;
     esac
 
-    print_info "正在申请 SSL 证书 (服务将自动重载)..."
+    print_info "正在申请真实 SSL 证书 (服务将自动重载)..."
     # shellcheck disable=SC2086
     if ! certbot --nginx --cert-name "$PRIMARY_DOMAIN" $certbot_domain_flags --email "$EMAIL" --agree-tos --no-eff-email -n --keep-until-expiring --redirect; then
-        print_warning "证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
+        print_warning "真实证书申请失败。Certbot 会尝试恢复 Nginx 配置。"
         return 1
     fi
     print_success "SSL 证书已成功申请并配置！"
@@ -727,16 +716,16 @@ renew_certificate() {
             ;;
     esac
 
-    printf "是否立即为 ${domain} 续期证书? (Y/n): "; read -r choice
+    printf "是否立即为 ${domain} 续期真实证书? (Y/n): "; read -r choice
     case "$choice" in
         [Nn]) print_info "操作已取消。"; sleep 2; return ;;
     esac
 
-    print_info "正在执行证书续期..."
+    print_info "正在执行真实证书续期..."
     if certbot renew --cert-name "$domain"; then
         print_success "Certbot 续期命令执行成功。"
-	print_info "正在重新加载 Nginx 以确保配置生效..."
-	apply_nginx_config
+        print_info "正在重新加载 Nginx 以确保配置生效..."
+        apply_nginx_config
     else
         print_warning "证书续期失败。"
     fi
