@@ -818,9 +818,9 @@ main() {
     
     while true; do
         clear
-        printf '%b\n' "${GREEN}=====================================================${NC}"
-        printf '%b\n' "${GREEN}      Nginx & Certbot 一键反代与 SSL 管理脚本      ${NC}"
-        printf '%b\n' "${GREEN}=====================================================${NC}"; printf '\n'
+        printf '%b\n' "${GREEN}======================================================${NC}"
+        printf '%b\n' "${GREEN}      Nginx & Certbot 一键反代与 SSL 管理脚本 V1.2.5     ${NC}"
+        printf '%b\n' "${GREEN}======================================================${NC}"; printf '\n'
 
         printf "请选择要执行的操作:\n"
         printf "  1) 创建新的反向代理配置\n"
