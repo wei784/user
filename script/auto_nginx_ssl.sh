@@ -4,8 +4,8 @@
 # 脚本名称: auto_nginx_ssl.sh
 # 脚本功能: 自动化配置、管理 Nginx 反向代理及 Certbot SSL 证书
 # 支持系统: Debian, Ubuntu, Alpine (POSIX sh 兼容)
-# 作者: Gemini 2.5 Pro
-# 版本: 1.2.4
+# 作者: Gemini 3.1 Pro
+# 版本: 1.2.5
 # ==============================================================================
 
 # --- 全局变量和颜色定义 ---
@@ -96,6 +96,20 @@ install_dependencies() {
         fi
     else
         print_success "所有依赖项均已安装。"
+    fi
+
+    # 针对 Alpine 系统，手动配置定时任务和启动 crond 服务
+    if [ "$OS_TYPE" = "alpine" ]; then
+        print_info "正在检查并配置 Alpine 的定时任务服务 (crond)..."
+        # 确保 crond 服务开机启动并正在运行
+        rc-update add crond default >/dev/null 2>&1
+        rc-service crond start >/dev/null 2>&1
+        
+        # 将 certbot 续期命令加入 root 用户的 crontab（如果还不存在的话）
+        if ! grep -q "certbot renew" /etc/crontabs/root 2>/dev/null; then
+            echo "0 0,12 * * * certbot renew --quiet" >> /etc/crontabs/root
+            print_success "已为 Alpine 系统添加 Certbot 自动续期定时任务。"
+        fi
     fi
 }
 
@@ -824,4 +838,3 @@ main() {
 }
 
 main
-
